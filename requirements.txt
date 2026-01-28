@@ -1,0 +1,5 @@
+pystray==0.19.5
+keyboard==0.13.5
+pywin32==311
+pillow==11.3.0
+pynput==1.8.1
