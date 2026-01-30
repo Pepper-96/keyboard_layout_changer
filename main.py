@@ -1,6 +1,7 @@
 import threading
 import sys
 import os
+import json
 import pystray
 from pystray import MenuItem as Item, Menu
 from PIL import Image
@@ -13,10 +14,18 @@ import win32event
 import win32api
 import winerror
 from pynput.keyboard import Key, Controller
+import tkinter as tk
+from tkinter import simpledialog
 
+# ------------------ Константы и таблицы ------------------
 
 # Имя mutex для защиты от запуска нескольких экземпляров
 MUTEX_NAME = "keyboard_layout_changer_single_instance_mutex"
+
+# Конфигурация
+APP_NAME = "Сменщик раскладки"
+CONFIG_FILE = "config.json"
+DEFAULT_HOTKEY = "ctrl+shift+q"
 
 # Наборы букв
 RU_CHARS = set("йцукенгшщзхъфывапролджэячсмитьбюЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ")
@@ -46,15 +55,17 @@ HOTKEY_PH = {
     "end": Key.end,
 }
 
+# текущее сочетание (строка) и id сочетания в keyboard
+current_hotkey_str: str | None = None
+current_hotkey_id: int | None = None
+
+# ------------------ Служебные функции ------------------
+
 def ensure_single_instance() -> int:
     """Запуск единственного экземпляра"""
-    # создаём / открываем именованный mutex
     handle = win32event.CreateMutex(None, False, MUTEX_NAME)
-    # проверяем, не существует ли он уже
     last_error = win32api.GetLastError()
     if last_error == winerror.ERROR_ALREADY_EXISTS:
-        # другой экземпляр уже создал mutex -> выходим
-        # можно сначала показать messagebox, если хочешь
         sys.exit(0)
     return handle
 
@@ -65,6 +76,39 @@ def resource_path(relative_path: str) -> str:
     else:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
+
+def load_hotkey() -> str:
+    """
+    Загрузка конфигурации
+
+    При наличии файла конфигурации в папке загружает комбинацию клавиш
+
+    Returns:
+        str: комбинация клавиш
+    """
+    if not os.path.exists(CONFIG_FILE):
+        return DEFAULT_HOTKEY
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("hotkey", DEFAULT_HOTKEY)
+    except Exception:
+        return DEFAULT_HOTKEY
+
+def save_hotkey(hotkey: str) -> None:
+    """
+    Сохранение конфигурации
+
+    Сохраняет комбинацию клавиш в файл конфигурации
+
+    Args:
+        hotkey(str): комбинация клавиш
+    """
+    data = {"hotkey": hotkey}
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+# ------------------ Работа с буфером ------------------
 
 def get_clipboard_text(retries: int = 5, delay: float = 0.05) -> str:
     """
@@ -127,6 +171,8 @@ def set_clipboard_text(text: str, retries: int = 5, delay: float = 0.05) -> None
             else:
                 raise
 
+# ------------------ Логика раскладки ------------------
+
 def detect_direction(text: str) -> str:
     """
     Определение требуемой раскладки по соотношению символов одной раскладки другой
@@ -151,7 +197,6 @@ def detect_direction(text: str) -> str:
     elif ru_count > en_count:
         return "en"
     else:
-        # Непонятно (цифры, символы, смесь) — можно оставить как есть
         return "none"
 
 def fix_layout(text: str) -> str:
@@ -172,6 +217,8 @@ def fix_layout(text: str) -> str:
     else:
         return text
 
+# ------------------ Горячие клавиши и их изменение ------------------
+
 def on_hotkey(hotkey: str) -> None:
     """
     Отклик на сочетание клавиш
@@ -188,19 +235,20 @@ def on_hotkey(hotkey: str) -> None:
     kb = Controller()
     # Отпускаем сочетание клавиш для вызова функции
     for key in hotkey.split("+"):
-        if key in HOTKEY_PH.keys():
-            kb.release(HOTKEY_PH[key])
+        k = key.strip()
+        if not k:
+            continue
+        if k in HOTKEY_PH.keys():
+            kb.release(HOTKEY_PH[k])
         else:
-            kb.release(key)
-    # Выполняем копирование выделенного текста через Ctrl+C
+            kb.release(k)
+    # Выполняем копирование выделенного текста через Ctrl+C, затем отпускаем
     kb.press(Key.ctrl)
     kb.press('c')
-    # Отпускаем сочетание клавиш для копирования
     kb.release('c')
     kb.release(Key.ctrl)
-    # Задержка для обновления буфера
+    # Задержка для обновления буфера, затем сохраняем в переменную
     time.sleep(0.05)
-    # Сохраняем текст из буфера в переменную
     selected = get_clipboard_text()
     if not selected:
         # Ничего не выделено или не текст
@@ -211,22 +259,83 @@ def on_hotkey(hotkey: str) -> None:
     fixed = fix_layout(selected)
     # Заменяем буфер исправленным текстом
     set_clipboard_text(fixed)
-    # Выполняем вставку через Ctrl+V
+    # Выполняем вставку через Ctrl+V, затем отпускаем
     kb.press(Key.ctrl)
     kb.press('v')
-    # Отпускаем сочетание клавиш для вставки
     kb.release('v')
     kb.release(Key.ctrl)
-    # Задержка для обновления буфера
+    # Задержка для обновления буфера, затем восстановление старого
     time.sleep(0.05)
-    # Восстановление старого буфера
     set_clipboard_text(old)
+
+def register_hotkey(hotkey: str) -> None:
+    """
+    Обновление сочетания клавиш
+
+    Обновляем сочетание клавиш и сохраняем его ID
+
+    Args:
+        hotkey(str): сочетание клавиш
+    """
+    global current_hotkey_str, current_hotkey_id
+
+    # Снимаем старое, если было
+    if current_hotkey_id is not None:
+        try:
+            keyboard.remove_hotkey(current_hotkey_id)
+        except KeyError:
+            pass
+
+    current_hotkey_str = hotkey
+    current_hotkey_id = keyboard.add_hotkey(hotkey, lambda: on_hotkey(hotkey))
+    save_hotkey(hotkey)
+
+def ask_hotkey_blocking(initial: str | None = None) -> str:
+    """
+    Запрос новой комбинации
+
+    Открывает окно с запросом на ввод новой комбинации клавиш
+
+    Args:
+        initial(str): старая комбинация
+
+    Returns:
+        str: новая комбинация
+    """
+    root = tk.Tk()
+    icon_path = resource_path("icon.png")
+    root.iconphoto(True, tk.PhotoImage(file=icon_path))
+    root.withdraw()
+    prompt = "Введите сочетание клавиш (например, ctrl+shift+q):"
+    default_value = initial or DEFAULT_HOTKEY
+    hotkey = simpledialog.askstring(APP_NAME, prompt, initialvalue=default_value, parent=root)
+    root.destroy()
+
+    if not hotkey:
+        hotkey = default_value
+    return hotkey.strip()
+
+def ask_and_set_hotkey_async() -> None:
+    """Запуск потока запроса комбинации"""
+    t = threading.Thread(
+        target=_ask_and_set_hotkey_worker,
+        daemon=True,
+    )
+    t.start()
+
+def _ask_and_set_hotkey_worker() -> None:
+    """Запрос новой комбинации"""
+    hotkey = ask_hotkey_blocking(current_hotkey_str)
+    if hotkey:
+        register_hotkey(hotkey)
 
 def start_hotkeys() -> None:
     """Добавление сочетания клавиш"""
-    hotkey = "ctrl+shift+q"
-    keyboard.add_hotkey(hotkey, lambda: on_hotkey(hotkey))
+    hotkey = load_hotkey()
+    register_hotkey(hotkey)
     keyboard.wait()  # блокирует поток, поэтому запускаем в отдельном
+
+# ------------------ Трей-меню ------------------
 
 def on_exit(icon, item) -> None:
     """Останавливает иконку и завершает процесс"""
@@ -234,14 +343,20 @@ def on_exit(icon, item) -> None:
     icon.stop()
     sys.exit(0)
 
+def on_change_hotkey(icon, item) -> None:
+    """Вызов окна замены комбинации клавиш"""
+    ask_and_set_hotkey_async()
+
 def run_tray() -> None:
     """Запуск программы в трее"""
+    # Иконка взята с сайта https://icons8.com/icon/hNH9bltZd4vJ/перевод
     icon_path = resource_path("icon.png")
     icon = pystray.Icon(
         "LayoutFixer",
         icon=Image.open(icon_path),
-        title="Сменщик раскладки", # Layout fixer
+        title=APP_NAME, # Layout fixer
         menu=Menu(
+            Item("Изменить сочетание клавиш...", on_change_hotkey),
             Item("Завершить", on_exit)   # пункт меню
         )
     )
@@ -249,7 +364,7 @@ def run_tray() -> None:
 
 if __name__ == "__main__":
     mutex = ensure_single_instance()
-    # Хоткеи в отдельном потоке
+    # Горячие клавиши в отдельном потоке
     t = threading.Thread(target=start_hotkeys, daemon=True)
     t.start()
     # Главный поток – иконка в трее
