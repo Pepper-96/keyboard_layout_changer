@@ -6,6 +6,7 @@ from pystray import MenuItem as Item, Menu
 from PIL import Image
 import time
 import keyboard
+import pywintypes
 import win32clipboard as cb
 import win32con
 import win32event
@@ -45,7 +46,7 @@ HOTKEY_PH = {
     "end": Key.end,
 }
 
-def ensure_single_instance() -> None:
+def ensure_single_instance() -> int:
     """Запуск единственного экземпляра"""
     # создаём / открываем именованный mutex
     handle = win32event.CreateMutex(None, False, MUTEX_NAME)
@@ -65,34 +66,66 @@ def resource_path(relative_path: str) -> str:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-def get_clipboard_text() -> str:
+def get_clipboard_text(retries: int = 5, delay: float = 0.05) -> str:
     """
-    Получение текста из буфера обмена
+    Чтение буфера
+
+    Получает текст из буфера обмена
+
+    Args:
+        retries(int): количество попыток чтения буфера
+        delay(float): задержка между попытками в секундах
 
     Returns:
         str: текст из буфера
     """
-    cb.OpenClipboard()
-    try:
-        if cb.IsClipboardFormatAvailable(win32con.CF_TEXT) or cb.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
-            data = cb.GetClipboardData(win32con.CF_UNICODETEXT)
-        else:
-            data = ""
-    finally:
-        cb.CloseClipboard()
-    return data
+    for i in range(retries):
+        try:
+            cb.OpenClipboard()
+            try:
+                if cb.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
+                    data = cb.GetClipboardData(win32con.CF_UNICODETEXT)
+                elif cb.IsClipboardFormatAvailable(win32con.CF_TEXT):
+                    data = cb.GetClipboardData(win32con.CF_TEXT)
+                else:
+                    data = ""
+            finally:
+                cb.CloseClipboard()
+            return data
+        except pywintypes.error as e:
+            # 5 = Access denied -> буфер занят другим процессом
+            if e.args[0] == 5:
+                time.sleep(delay)
+                continue
+            else:
+                raise
+    # Не смогли открыть после всех попыток
+    return ""
 
-def set_clipboard_text(text: str) -> None:
+def set_clipboard_text(text: str, retries: int = 5, delay: float = 0.05) -> None:
     """
     Перезапись буфера обмена
 
     Args:
         text(str): текст, копируемый в буфер
+        retries(int): количество попыток записи в буфер
+        delay(float): задержка между попытками в секундах
     """
-    cb.OpenClipboard()
-    cb.EmptyClipboard()
-    cb.SetClipboardText(text, win32con.CF_UNICODETEXT)
-    cb.CloseClipboard()
+    for i in range(retries):
+        try:
+            cb.OpenClipboard()
+            try:
+                cb.EmptyClipboard()
+                cb.SetClipboardText(text, win32con.CF_UNICODETEXT)
+            finally:
+                cb.CloseClipboard()
+            return
+        except pywintypes.error as e:
+            if e.args[0] == 5:
+                time.sleep(delay)
+                continue
+            else:
+                raise
 
 def detect_direction(text: str) -> str:
     """
